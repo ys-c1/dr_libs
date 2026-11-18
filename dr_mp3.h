@@ -332,6 +332,25 @@ typedef struct
     drmp3_uint16 pcmFramesToDiscard;    /* The number of leading samples to read and discard. These are discarded after mp3FramesToDiscard. */
 } drmp3_seek_point;
 
+/* Number of bad-frame positions retained by a drmp3 decoder. The most recent events are kept. */
+#ifndef DRMP3_MAX_BAD_FRAME_EVENTS
+#define DRMP3_MAX_BAD_FRAME_EVENTS 32
+#endif
+
+/*
+Information about a single MP3 frame that could not be decoded and was skipped during frame synchronization.
+
+mp3FrameIndex     The ordinal of the MP3 frame in the stream, counting only successfully decoded frames, at the point the bad frame was hit.
+streamCursor      The byte offset of the first un-decodable byte relative to the start of the stream passed to drmp3_init*().
+bytesSkipped      The number of raw bytes skipped before synchronization was regained. Zero if the end of the stream was reached first.
+*/
+typedef struct
+{
+    drmp3_uint64 mp3FrameIndex;
+    drmp3_uint64 streamCursor;
+    drmp3_uint64 bytesSkipped;
+} drmp3_bad_frame_info;
+
 typedef enum
 {
     DRMP3_METADATA_TYPE_ID3V1,
@@ -414,6 +433,8 @@ typedef struct
     drmp3_allocation_callbacks allocationCallbacks;
     drmp3_uint32 mp3FrameChannels;      /* The number of channels in the currently loaded MP3 frame. Internal use only. */
     drmp3_uint32 mp3FrameSampleRate;    /* The sample rate of the currently loaded MP3 frame. Internal use only. */
+    drmp3_uint32 mp3FrameGranuleCount;  /* Number of synthesis granules in the last successfully decoded Layer III frame (2 for MPEG1). Internal use only. */
+    drmp3_uint32 mp3FrameLayer;         /* MPEG layer (1, 2 or 3) of the last successfully decoded frame. Internal use only. */
     drmp3_uint32 pcmFramesConsumedInMP3Frame;
     drmp3_uint32 pcmFramesRemainingInMP3Frame;
     drmp3_uint8 pcmFrames[sizeof(float)*DRMP3_MAX_SAMPLES_PER_FRAME];  /* <-- Multipled by sizeof(float) to ensure there's enough room for DR_MP3_FLOAT_OUTPUT. */
@@ -426,9 +447,15 @@ typedef struct
     drmp3_uint32 delayInPCMFrames;
     drmp3_uint32 paddingInPCMFrames;
     drmp3_uint32 mp3FramesSkipped;      /* MP3 frames without output skipped by the last decode. Internal use only. */
+    drmp3_uint32 mp3FrameIndex;         /* Ordinal of the current MP3 frame, counting only successfully decoded frames. Internal use only. */
     drmp3_uint64 totalPCMFrameCount;    /* Set to DRMP3_UINT64_MAX if the length is unknown. Includes delay and padding. */
     drmp3_bool32 isVBR;
     drmp3_bool32 isCBR;
+    drmp3_uint32 maxBadFramesToSkip;    /* Maximum number of undecodable MP3 frames that may be skipped to resynchronize. 0 means unlimited. */
+    drmp3_uint64 badFrameCount;         /* Total number of undecodable MP3 frames encountered for the lifetime of the decoder. */
+    drmp3_bool32 decodeError;           /* Set when decoding stops because of an error, such as reaching maxBadFramesToSkip. Clean EOF leaves this false. */
+    drmp3_bad_frame_info badFrames[DRMP3_MAX_BAD_FRAME_EVENTS];  /* The most recent bad-frame positions. Internal use only; read with drmp3_get_bad_frames(). */
+    drmp3_uint32 badFrameHead;          /* Ring buffer position of the oldest retained bad-frame event. Internal use only. */
     size_t dataSize;
     size_t dataCapacity;
     size_t dataConsumed;
@@ -529,6 +556,38 @@ radio. Runs in linear time. Returns 0 on error.
 This is equivalent to calling drmp3_get_mp3_frame_count() and drmp3_get_pcm_frame_count() except that it's more efficient.
 */
 DRMP3_API drmp3_bool32 drmp3_get_mp3_and_pcm_frame_count(drmp3* pMP3, drmp3_uint64* pMP3FrameCount, drmp3_uint64* pPCMFrameCount);
+
+/*
+Sets the maximum number of undecodable MP3 frames the decoder may skip while resynchronizing.
+
+When a frame cannot be decoded, dr_mp3 skips past it and resumes at the next valid frame sync. Once this limit of bad
+frames has been reached, decoding stops and drmp3_get_decode_error() returns true. A value of 0, the default, removes
+the limit so every resynchronizable bad frame is skipped. The counter itself is always available through
+drmp3_get_bad_frame_count() regardless of this limit.
+*/
+DRMP3_API void drmp3_set_max_bad_frames_to_skip(drmp3* pMP3, drmp3_uint32 maxBadFrames);
+
+/*
+Returns the number of undecodable MP3 frames skipped since the decoder was initialized.
+*/
+DRMP3_API drmp3_uint64 drmp3_get_bad_frame_count(drmp3* pMP3);
+
+/*
+Copies information about the most recent bad frames into pBadFramesOut and returns the number copied.
+
+Up to capacity events are returned, oldest first. Bad frames beyond the retained window are still included in the count
+from drmp3_get_bad_frame_count(). Pass NULL/0 to query the number of retained events.
+*/
+DRMP3_API drmp3_uint32 drmp3_get_bad_frames(drmp3* pMP3, drmp3_bad_frame_info* pBadFramesOut, drmp3_uint32 capacity);
+
+/*
+Returns whether decoding stopped because of an error rather than reaching the end of the stream.
+
+This is true when the bad-frame skip limit set with drmp3_set_max_bad_frames_to_skip() was reached while more stream data
+might still remain. A stream that simply runs out after a complete frame, or while holding a single unresynchronizable
+trailing fragment, is a clean end of stream and leaves this false even though the fragment is counted as a bad frame.
+*/
+DRMP3_API drmp3_bool32 drmp3_get_decode_error(drmp3* pMP3);
 
 /*
 Calculates the seekpoints based on PCM frames. This is slow.
@@ -2264,6 +2323,59 @@ static void drmp3d_synth_granule(float *qmf_state, float *grbuf, int nbands, int
     }
 }
 
+/*
+Advances the cross-frame synthesis state with silence for one MP3 frame.
+
+An undecodable frame produces no output, but the decoder keeps cross-frame state in the IMDCT overlap-add buffers
+(mdct_overlap, Layer III only) and the polyphase filter bank (qmf_state). Feeding zeros through the same synthesis path
+keeps that state aligned with a stream in which the bad frame decoded to silence, so the next good frame can be recovered
+sample-for-sample. This drives only the synthesis path and never parses a bitstream. layer is the value reported in
+drmp3dec_frame_info (1, 2 or 3); granuleCount is the number of Layer III synthesis granules (2 for MPEG1, 1 otherwise).
+*/
+static void drmp3d_flush_silence(drmp3dec* pDecoder, int channels, int layer, int granuleCount)
+{
+    float grbuf[2][576];
+    drmp3d_sample_t pcm[DRMP3_MAX_SAMPLES_PER_FRAME];
+    int igranule;
+    int ichannel;
+
+    if (channels <= 0 || layer <= 0) {
+        return;
+    }
+
+    DRMP3_ZERO_MEMORY(pcm, sizeof(pcm));
+
+    if (layer == 3) {
+        for (igranule = 0; igranule < granuleCount; igranule += 1) {
+            DRMP3_ZERO_MEMORY(grbuf, sizeof(grbuf));
+
+            /* Long-block IMDCT on zero input rotates the overlap-add buffers without introducing any signal. */
+            for (ichannel = 0; ichannel < channels; ichannel += 1) {
+                drmp3_L3_imdct_gr(grbuf[ichannel], pDecoder->mdct_overlap[ichannel], 0, 0);
+            }
+
+            /* Layer III always synthesizes 18 sub-bands per granule. */
+            drmp3d_synth_granule(pDecoder->qmf_state, grbuf[0], 18, channels,
+                                 (drmp3d_sample_t*)pcm, pDecoder->scratch.syn[0]);
+        }
+    } else {
+        /* Layer I synthesizes one 384-sample granule, Layer II three. Neither uses the IMDCT overlap buffers. */
+        int granuleCount12 = (layer == 1) ? 1 : 3;
+
+        for (igranule = 0; igranule < granuleCount12; igranule += 1) {
+            DRMP3_ZERO_MEMORY(grbuf, sizeof(grbuf));
+            drmp3d_synth_granule(pDecoder->qmf_state, grbuf[0], 12, channels,
+                                 (drmp3d_sample_t*)pcm, pDecoder->scratch.syn[0]);
+        }
+    }
+}
+
+/* Number of Layer III synthesis granules in a frame: two for MPEG1, one for MPEG2/2.5. */
+static int drmp3__layer3_granule_count(const drmp3_uint8* pHeader)
+{
+    return DRMP3_HDR_TEST_MPEG1(pHeader) ? 2 : 1;
+}
+
 static int drmp3_hdr_is_null(const drmp3_uint8 *hdr)
 {
     return !hdr[0] && !hdr[1] && !hdr[2] && !hdr[3];
@@ -2759,6 +2871,70 @@ static void drmp3__on_meta(drmp3* pMP3, drmp3_metadata_type type, const void* pR
 }
 
 
+/*
+Records a bad frame that could not be decoded. The most recent DRMP3_MAX_BAD_FRAME_EVENTS positions are retained in a ring.
+Returns DR_FALSE once the configured skip limit has been reached.
+*/
+static drmp3_bool32 drmp3_register_bad_frame(drmp3* pMP3, drmp3_uint64 streamCursor, drmp3_uint64 bytesSkipped)
+{
+    drmp3_bad_frame_info* pEvent;
+    drmp3_uint32 slot;
+
+    DRMP3_ASSERT(pMP3 != NULL);
+
+    if (pMP3->maxBadFramesToSkip != 0 && pMP3->badFrameCount >= pMP3->maxBadFramesToSkip) {
+        pMP3->decodeError = DRMP3_TRUE;
+        return DRMP3_FALSE;
+    }
+
+    /*
+    Keep the synthesis filter bank aligned with a stream in which the bad frame decoded to silence. This is skipped for
+    the very first frame, when no frame layout (channels/granule count) has been established yet.
+    */
+    if (pMP3->mp3FrameChannels > 0 && pMP3->mp3FrameLayer > 0) {
+        drmp3d_flush_silence(&pMP3->decoder, (int)pMP3->mp3FrameChannels,
+                             (int)pMP3->mp3FrameLayer, (int)pMP3->mp3FrameGranuleCount);
+    }
+
+    slot = (drmp3_uint32)(pMP3->badFrameCount % DRMP3_MAX_BAD_FRAME_EVENTS);
+    pEvent = &pMP3->badFrames[slot];
+
+    pEvent->mp3FrameIndex = (drmp3_uint64)pMP3->mp3FrameIndex;
+    pEvent->streamCursor   = streamCursor;
+    pEvent->bytesSkipped   = bytesSkipped;
+
+    pMP3->badFrameCount += 1;
+
+    if (pMP3->badFrameCount > DRMP3_MAX_BAD_FRAME_EVENTS) {
+        pMP3->badFrameHead = (drmp3_uint32)(pMP3->badFrameCount % DRMP3_MAX_BAD_FRAME_EVENTS);
+    } else {
+        pMP3->badFrameHead = 0;
+    }
+
+    return DRMP3_TRUE;
+}
+
+/*
+Scans forward from pData for the next byte pattern that minimp3 accepts as an MP3 frame header. Returns the offset of the
+sync word, or the number of bytes scanned if none was found. This only inspects header bytes and never parses a bitstream.
+*/
+static size_t drmp3_find_next_sync(const drmp3_uint8* pData, size_t dataSize)
+{
+    size_t i;
+
+    DRMP3_ASSERT(pData != NULL);
+
+    /* A full 4-byte header is needed, so the last three bytes cannot start a frame. */
+    for (i = 0; i + DRMP3_HDR_SIZE <= dataSize; i += 1) {
+        if (drmp3_hdr_valid(pData + i)) {
+            return i;
+        }
+    }
+
+    return i;
+}
+
+
 static drmp3_uint32 drmp3_decode_next_frame_ex__callbacks(drmp3* pMP3, drmp3d_sample_t* pPCMFrames, drmp3dec_frame_info* pMP3FrameInfo, const drmp3_uint8** ppMP3FrameData)
 {
     drmp3_uint32 pcmFramesRead = 0;
@@ -2836,6 +3012,9 @@ static drmp3_uint32 drmp3_decode_next_frame_ex__callbacks(drmp3* pMP3, drmp3d_sa
             pMP3->pcmFramesRemainingInMP3Frame = pcmFramesRead;
             pMP3->mp3FrameChannels = info.channels;
             pMP3->mp3FrameSampleRate = info.sample_rate;
+            pMP3->mp3FrameLayer = (drmp3_uint32)info.layer;
+            pMP3->mp3FrameGranuleCount = (drmp3_uint32)drmp3__layer3_granule_count(pMP3->decoder.header);
+            pMP3->mp3FrameIndex += 1;
 
             if (pMP3FrameInfo != NULL) {
                 *pMP3FrameInfo = info;
@@ -2873,13 +3052,56 @@ static drmp3_uint32 drmp3_decode_next_frame_ex__callbacks(drmp3* pMP3, drmp3d_sa
             /* Fill in a chunk. */
             bytesRead = drmp3__on_read_clamped(pMP3, pMP3->pData + pMP3->dataSize, (pMP3->dataCapacity - pMP3->dataSize));
             if (bytesRead == 0) {
-                pMP3->atEnd = DRMP3_TRUE;
-                return 0; /* Error reading more data. */
+                /*
+                No more data is available. A non-empty buffer therefore ends in an undecodable region: either a truncated
+                frame or garbage with no further frame sync. Resynchronize manually instead of aborting the whole stream.
+                */
+                size_t syncOffset;
+                drmp3_uint64 badCursor;
+
+                if (pMP3->dataSize == 0) {
+                    pMP3->atEnd = DRMP3_TRUE;
+                    return 0; /* Clean end of stream. */
+                }
+
+                badCursor  = pMP3->streamCursor - (drmp3_uint64)pMP3->dataSize;
+                syncOffset = drmp3_find_next_sync(pMP3->pData, pMP3->dataSize);
+
+                if (!drmp3_register_bad_frame(pMP3, badCursor, (drmp3_uint64)syncOffset)) {
+                    pMP3->atEnd = DRMP3_TRUE;
+                    return 0; /* Bad-frame skip limit reached. */
+                }
+
+                /* The buffer holds stream bytes [streamCursor - dataSize, streamCursor), so moving dataConsumed does not move streamCursor. */
+                pMP3->dataConsumed = syncOffset;
+                pMP3->dataSize     -= syncOffset;
+
+                if (pMP3->dataSize < DRMP3_HDR_SIZE) {
+                    /* No complete header was found, so the remaining bytes cannot start another frame. */
+                    pMP3->atEnd = DRMP3_TRUE;
+                    return 0;
+                }
+
+                /* A sync word is buffered; loop back and let drmp3dec_decode_frame validate and decode it. */
+                continue;
             }
 
             pMP3->dataSize += bytesRead;
-        } else if (info.layer != 0) {
-            pMP3->mp3FramesSkipped += 1;
+        } else if (info.frame_bytes > 0) {
+            /* drmp3dec_decode_frame consumed bytes without producing output: it skipped an undecodable frame. */
+            drmp3_uint64 badCursor;
+
+            /* The consumed bytes already include the bad frame, so subtract its size to reach its first byte. */
+            badCursor = pMP3->streamCursor - (drmp3_uint64)pMP3->dataSize - (drmp3_uint64)info.frame_bytes;
+
+            if (info.layer != 0) {
+                pMP3->mp3FramesSkipped += 1;
+            }
+
+            if (!drmp3_register_bad_frame(pMP3, badCursor, (drmp3_uint64)info.frame_bytes)) {
+                pMP3->atEnd = DRMP3_TRUE;
+                return 0;
+            }
         }
     };
 
@@ -2906,6 +3128,9 @@ static drmp3_uint32 drmp3_decode_next_frame_ex__memory(drmp3* pMP3, drmp3d_sampl
             pMP3->pcmFramesRemainingInMP3Frame = pcmFramesRead;
             pMP3->mp3FrameChannels             = info.channels;
             pMP3->mp3FrameSampleRate           = info.sample_rate;
+            pMP3->mp3FrameLayer                = (drmp3_uint32)info.layer;
+            pMP3->mp3FrameGranuleCount         = (drmp3_uint32)drmp3__layer3_granule_count(pMP3->decoder.header);
+            pMP3->mp3FrameIndex                += 1;
 
             if (pMP3FrameInfo != NULL) {
                 *pMP3FrameInfo = info;
@@ -2917,16 +3142,55 @@ static drmp3_uint32 drmp3_decode_next_frame_ex__memory(drmp3* pMP3, drmp3d_sampl
 
             break;
         } else if (info.frame_bytes > 0) {
-            /* No frames were read, but it looks like we skipped past one. Read the next MP3 frame. */
+            /* No frames were produced, but bytes were consumed: minimp3 skipped past an undecodable frame. */
+            drmp3_uint64 badCursor = pMP3->streamCursor;
+
             if (info.layer != 0) {
                 pMP3->mp3FramesSkipped += 1;
+            }
+
+            if (!drmp3_register_bad_frame(pMP3, badCursor, (drmp3_uint64)info.frame_bytes)) {
+                pMP3->atEnd = DRMP3_TRUE;
+                break;
             }
 
             pMP3->memory.currentReadPos += (size_t)info.frame_bytes;
             pMP3->streamCursor          += (size_t)info.frame_bytes;
         } else {
-            /* Nothing at all was read. Abort. */
-            break;
+            /*
+            minimp3 could not find another frame header at all. Scan for the next valid frame sync manually so one bad
+            region does not abort the rest of the stream.
+            */
+            size_t bytesRemaining;
+            const drmp3_uint8* pCursor;
+            size_t syncOffset;
+            drmp3_uint64 badCursor;
+
+            bytesRemaining = pMP3->memory.dataSize - pMP3->memory.currentReadPos;
+            if (bytesRemaining == 0) {
+                break;
+            }
+
+            pCursor    = pMP3->memory.pData + pMP3->memory.currentReadPos;
+            badCursor  = pMP3->streamCursor;
+            syncOffset = drmp3_find_next_sync(pCursor, bytesRemaining);
+            if (syncOffset == 0) {
+                /* The current bytes pass the lightweight header check but minimp3 rejected them; force forward progress. */
+                syncOffset = 1;
+            }
+
+            if (!drmp3_register_bad_frame(pMP3, badCursor, (drmp3_uint64)syncOffset)) {
+                pMP3->atEnd = DRMP3_TRUE;
+                break;
+            }
+
+            pMP3->memory.currentReadPos += syncOffset;
+            pMP3->streamCursor          += (drmp3_uint64)syncOffset;
+
+            if (pMP3->memory.currentReadPos >= pMP3->memory.dataSize) {
+                pMP3->atEnd = DRMP3_TRUE;
+                break;
+            }
         }
     }
 
@@ -4262,6 +4526,60 @@ DRMP3_API void drmp3_uninit(drmp3* pMP3)
 #endif
 
     drmp3__free_from_callbacks(pMP3->pData, &pMP3->allocationCallbacks);
+}
+
+DRMP3_API void drmp3_set_max_bad_frames_to_skip(drmp3* pMP3, drmp3_uint32 maxBadFrames)
+{
+    if (pMP3 == NULL) {
+        return;
+    }
+
+    pMP3->maxBadFramesToSkip = maxBadFrames;
+}
+
+DRMP3_API drmp3_uint64 drmp3_get_bad_frame_count(drmp3* pMP3)
+{
+    if (pMP3 == NULL) {
+        return 0;
+    }
+
+    return pMP3->badFrameCount;
+}
+
+DRMP3_API drmp3_uint32 drmp3_get_bad_frames(drmp3* pMP3, drmp3_bad_frame_info* pBadFramesOut, drmp3_uint32 capacity)
+{
+    drmp3_uint32 retained;
+    drmp3_uint32 i;
+
+    if (pMP3 == NULL) {
+        return 0;
+    }
+
+    retained = (drmp3_uint32)DRMP3_MIN(pMP3->badFrameCount, (drmp3_uint64)DRMP3_MAX_BAD_FRAME_EVENTS);
+    if (pBadFramesOut == NULL || capacity == 0) {
+        return retained;
+    }
+
+    if (capacity > retained) {
+        capacity = retained;
+    }
+
+    /* Copy oldest first from the ring buffer. */
+    for (i = 0; i < capacity; i += 1) {
+        drmp3_uint32 slot = (pMP3->badFrameHead + i) % DRMP3_MAX_BAD_FRAME_EVENTS;
+        pBadFramesOut[i] = pMP3->badFrames[slot];
+    }
+
+    return capacity;
+}
+
+DRMP3_API drmp3_bool32 drmp3_get_decode_error(drmp3* pMP3)
+{
+    if (pMP3 == NULL) {
+        return DRMP3_FALSE;
+    }
+
+    return pMP3->decodeError;
 }
 
 #if defined(DR_MP3_FLOAT_OUTPUT)

@@ -10,3 +10,5 @@
 /external/mpg123
 /tests/wav/archive
 /tests/exceptions-private.txt
+/tests/recovery/bin/
+/tests/recovery/vectors/
