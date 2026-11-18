@@ -467,14 +467,17 @@ typedef struct
     size_t currentReadPos;
 } drwav__memory_stream;
 
-/* Structure for internal use. Only used for writers opened with drwav_init_memory_write(). */
+/* Structure for internal use. Only used for writers opened with drwav_init_memory_write() or drwav_init_fixed_memory_write(). */
 typedef struct
 {
-    void** ppData;
-    size_t* pDataSize;
-    size_t dataSize;
-    size_t dataCapacity;
-    size_t currentWritePos;
+    void** ppData;                          /* Output pointer for the growable mode. NULL in fixed-buffer mode. */
+    size_t* pDataSize;                      /* Output for the number of bytes written. */
+    drwav_uint8* pData;                     /* Base address of the buffer being written to. */
+    drwav_uint64 dataSize;                  /* Logical size of the stream (highest position ever written). */
+    drwav_uint64 dataCapacity;              /* Allocated capacity (growable) or the caller's hard limit (fixed). */
+    drwav_uint64 currentWritePos;           /* 64-bit write cursor so sparse streams larger than 4GB can be addressed. */
+    drwav_bool32 isFixedBuffer;             /* DRWAV_TRUE when the caller owns the buffer (drwav_init_fixed_memory_write()). */
+    drwav_result error;                     /* Sticky error from a failed write or seek. Surfaced by drwav_uninit(). */
 } drwav__memory_stream_write;
 
 typedef struct
@@ -1050,6 +1053,19 @@ DRWAV_API drwav_metadata* drwav_take_ownership_of_metadata(drwav* pWav);
 Uninitializes the given drwav object.
 
 Use this only for objects initialized with drwav_init*() functions (drwav_init(), drwav_init_ex(), drwav_init_write(), drwav_init_write_sequential()).
+
+For writers, any placeholder RIFF/data chunk sizes are backfilled one final time before the object is closed.
+
+This function is idempotent: calling it again on an already-uninitialized object is a no-op that returns DRWAV_SUCCESS,
+and drwav_uninit(NULL) returns DRWAV_INVALID_ARGS.
+
+For memory writers, stream failures recorded while writing are reported here:
+  DRWAV_OUT_OF_RANGE - a write or seek exceeded the fixed buffer's capacity (drwav_init_fixed_memory_write()).
+  DRWAV_OUT_OF_MEMORY - the growable buffer could not be reallocated (drwav_init_memory_write() family).
+  DRWAV_BAD_SEEK     - a seek before the start of the buffer was requested.
+  DRWAV_TOO_BIG      - the stream grew past what this platform can address.
+  DRWAV_INVALID_FILE - sequential mode validation failed (sample count mismatch).
+On failure the output buffer still contains everything written up to the point of failure.
 */
 DRWAV_API drwav_result drwav_uninit(drwav* pWav);
 
@@ -1290,6 +1306,32 @@ until after drwav_uninit() has been called.
 DRWAV_API drwav_bool32 drwav_init_memory_write(drwav* pWav, void** ppData, size_t* pDataSize, const drwav_data_format* pFormat, const drwav_allocation_callbacks* pAllocationCallbacks);
 DRWAV_API drwav_bool32 drwav_init_memory_write_sequential(drwav* pWav, void** ppData, size_t* pDataSize, const drwav_data_format* pFormat, drwav_uint64 totalSampleCount, const drwav_allocation_callbacks* pAllocationCallbacks);
 DRWAV_API drwav_bool32 drwav_init_memory_write_sequential_pcm_frames(drwav* pWav, void** ppData, size_t* pDataSize, const drwav_data_format* pFormat, drwav_uint64 totalPCMFrameCount, const drwav_allocation_callbacks* pAllocationCallbacks);
+
+/*
+Helper for initializing a writer which outputs data to a caller-owned, fixed-size memory buffer.
+
+Unlike drwav_init_memory_write(), dr_wav never allocates, reallocates or frees the buffer - ownership stays with
+the caller, and the same buffer address is used for the whole lifetime of the writer. The buffer must stay valid
+until drwav_uninit() returns. The internal write cursor is 64-bit (drwav_uint64); when the buffer is backed by
+sparse storage (for example an mmap of a sparse file) streams larger than 4GB can be addressed without truncation.
+
+pDataSize [out] is set to the number of bytes written while the writer is open.
+
+The buffer is treated as pre-initialized: bytes skipped by a sparse seek are not zero-filled by dr_wav. Initialize
+the buffer (for example with mmap of a zero-filled sparse file) if file-identical output in skipped regions is
+required.
+
+A write that would extend past dataCapacity is rejected without touching the out-of-range bytes. The failed write
+returns 0 frames/bytes, the condition is recorded, and drwav_uninit() returns DRWAV_OUT_OF_RANGE. An allocation
+failure cannot occur in this mode; it is reported as DRWAV_OUT_OF_MEMORY only by the growable drwav_init_memory_write()
+family. Other stream failures use DRWAV_BAD_SEEK or DRWAV_TOO_BIG.
+
+The non-sequential writer places placeholder RIFF/data chunk sizes in the header and backfills the real values
+while writing and once more from drwav_uninit().
+
+See also: drwav_init_memory_write(), drwav_uninit()
+*/
+DRWAV_API drwav_bool32 drwav_init_fixed_memory_write(drwav* pWav, void* pData, drwav_uint64 dataCapacity, size_t* pDataSize, const drwav_data_format* pFormat, const drwav_allocation_callbacks* pAllocationCallbacks);
 
 
 #ifndef DR_WAV_NO_CONVERSION_API
@@ -5691,76 +5733,163 @@ DRWAV_PRIVATE drwav_bool32 drwav__on_seek_memory(void* pUserData, int offset, dr
     return DRWAV_TRUE;
 }
 
+/*
+Records a sticky error on a memory writer. The first error wins so the original failure reason is not
+overwritten by follow-on errors. The recorded code is returned by drwav_uninit().
+*/
+DRWAV_PRIVATE void drwav__memory_stream_write_set_error(drwav__memory_stream_write* pStream, drwav_result error)
+{
+    if (pStream->error == DRWAV_SUCCESS) {
+        pStream->error = error;
+    }
+}
+
 DRWAV_PRIVATE size_t drwav__on_write_memory(void* pUserData, const void* pDataIn, size_t bytesToWrite)
 {
     drwav* pWav = (drwav*)pUserData;
-    size_t bytesRemaining;
+    drwav__memory_stream_write* pStream;
+    drwav_uint64 endPos;
+    drwav_uint64 newCapacity;
 
     DRWAV_ASSERT(pWav != NULL);
-    DRWAV_ASSERT(pWav->memoryStreamWrite.dataCapacity >= pWav->memoryStreamWrite.currentWritePos);
+    pStream = &pWav->memoryStreamWrite;
+    /* In fixed mode the seek handler guarantees the cursor never passes the hard capacity. Growable
+       mode may position the cursor beyond the current allocation (sparse positioning); it grows here. */
+    DRWAV_ASSERT(!pStream->isFixedBuffer || pStream->dataCapacity >= pStream->currentWritePos);
 
-    bytesRemaining = pWav->memoryStreamWrite.dataCapacity - pWav->memoryStreamWrite.currentWritePos;
-    if (bytesRemaining < bytesToWrite) {
-        /* Need to reallocate. */
-        void* pNewData;
-        size_t newDataCapacity = (pWav->memoryStreamWrite.dataCapacity == 0) ? 256 : pWav->memoryStreamWrite.dataCapacity * 2;
+    if (bytesToWrite == 0) {
+        return 0;
+    }
 
-        /* If doubling wasn't enough, just make it the minimum required size to write the data. */
-        if ((newDataCapacity - pWav->memoryStreamWrite.currentWritePos) < bytesToWrite) {
-            newDataCapacity = pWav->memoryStreamWrite.currentWritePos + bytesToWrite;
-        }
+    /* A stream that has already failed stays failed. */
+    if (pStream->error != DRWAV_SUCCESS) {
+        return 0;
+    }
 
-        pNewData = drwav__realloc_from_callbacks(*pWav->memoryStreamWrite.ppData, newDataCapacity, pWav->memoryStreamWrite.dataCapacity, &pWav->allocationCallbacks);
-        if (pNewData == NULL) {
+    /* Guard against 64-bit position arithmetic overflow. */
+    if (pStream->currentWritePos > (drwav_uint64)(DRWAV_SIZE_MAX - bytesToWrite)) {
+        drwav__memory_stream_write_set_error(pStream, DRWAV_TOO_BIG);
+        return 0;
+    }
+    endPos = pStream->currentWritePos + (drwav_uint64)bytesToWrite;
+
+    if (endPos > pStream->dataCapacity) {
+        if (pStream->isFixedBuffer) {
+            /* The caller's buffer has a hard capacity. Never write past it. */
+            drwav__memory_stream_write_set_error(pStream, DRWAV_OUT_OF_RANGE);
             return 0;
         }
 
-        *pWav->memoryStreamWrite.ppData = pNewData;
-        pWav->memoryStreamWrite.dataCapacity = newDataCapacity;
+        /* Growable mode: double the capacity, but never more than what size_t can index on this platform. */
+        newCapacity = (pStream->dataCapacity == 0) ? 256 : pStream->dataCapacity * 2;
+        if (newCapacity < endPos) {
+            newCapacity = endPos;   /* Doubling wasn't enough; grow to the exact required size. */
+        }
+        if (newCapacity > (drwav_uint64)DRWAV_SIZE_MAX) {
+            drwav__memory_stream_write_set_error(pStream, DRWAV_TOO_BIG);
+            return 0;
+        }
+
+        {
+            void* pNewData = drwav__realloc_from_callbacks(*pStream->ppData, (size_t)newCapacity, (size_t)pStream->dataCapacity, &pWav->allocationCallbacks);
+            if (pNewData == NULL) {
+                drwav__memory_stream_write_set_error(pStream, DRWAV_OUT_OF_MEMORY);
+                return 0;
+            }
+
+            *pStream->ppData = pNewData;
+            pStream->pData = (drwav_uint8*)pNewData;
+            pStream->dataCapacity = newCapacity;
+        }
     }
 
-    DRWAV_COPY_MEMORY(((drwav_uint8*)(*pWav->memoryStreamWrite.ppData)) + pWav->memoryStreamWrite.currentWritePos, pDataIn, bytesToWrite);
-
-    pWav->memoryStreamWrite.currentWritePos += bytesToWrite;
-    if (pWav->memoryStreamWrite.dataSize < pWav->memoryStreamWrite.currentWritePos) {
-        pWav->memoryStreamWrite.dataSize = pWav->memoryStreamWrite.currentWritePos;
+    /*
+    Sparse write: when seeking past the current end and then writing, the gap contains undefined memory
+    from realloc(). A real file would read as zeroes in that range, so zero-fill the gap to keep memory
+    output byte-for-byte identical to file output. In fixed-buffer mode the caller guarantees the buffer
+    is initialized, so only the freshly grown region in growable mode needs this.
+    */
+    if (pStream->currentWritePos > pStream->dataSize) {
+        if (!pStream->isFixedBuffer) {
+            DRWAV_ZERO_MEMORY(pStream->pData + pStream->dataSize, (size_t)(pStream->currentWritePos - pStream->dataSize));
+        }
+        pStream->dataSize = pStream->currentWritePos;
     }
 
-    *pWav->memoryStreamWrite.pDataSize = pWav->memoryStreamWrite.dataSize;
+    DRWAV_COPY_MEMORY(pStream->pData + pStream->currentWritePos, pDataIn, bytesToWrite);
+
+    pStream->currentWritePos = endPos;
+    if (pStream->dataSize < pStream->currentWritePos) {
+        pStream->dataSize = pStream->currentWritePos;
+    }
+
+    *pStream->pDataSize = (pStream->dataSize <= (drwav_uint64)DRWAV_SIZE_MAX) ? (size_t)pStream->dataSize : (size_t)DRWAV_SIZE_MAX;
 
     return bytesToWrite;
 }
 
-DRWAV_PRIVATE drwav_bool32 drwav__on_seek_memory_write(void* pUserData, int offset, drwav_seek_origin origin)
+/*
+64-bit seek for memory writers. The public drwav_seek_proc still takes a 32-bit offset, so callers needing
+positions at or beyond 2GB must reach this through the chunked drwav__seek_* helpers. Sparse streams are
+supported: a seek past the current logical end is allowed and the gap is zero-filled on the next write.
+*/
+DRWAV_PRIVATE drwav_bool32 drwav__on_seek_memory_write_64(drwav__memory_stream_write* pStream, drwav_int64 offset, drwav_seek_origin origin)
 {
-    drwav* pWav = (drwav*)pUserData;
-    drwav_int64 newCursor;
-
-    DRWAV_ASSERT(pWav != NULL);
+    drwav_uint64 base;
+    drwav_uint64 newCursor;
 
     if (origin == DRWAV_SEEK_SET) {
-        newCursor = 0;
+        base = 0;
     } else if (origin == DRWAV_SEEK_CUR) {
-        newCursor = (drwav_int64)pWav->memoryStreamWrite.currentWritePos;
+        base = pStream->currentWritePos;
     } else if (origin == DRWAV_SEEK_END) {
-        newCursor = (drwav_int64)pWav->memoryStreamWrite.dataSize;
+        base = pStream->dataSize;
     } else {
         DRWAV_ASSERT(!"Invalid seek origin");
         return DRWAV_FALSE;
     }
 
-    newCursor += offset;
-
-    if (newCursor < 0) {
-        return DRWAV_FALSE;  /* Trying to seek prior to the start of the buffer. */
+    /*
+    Compute the new cursor with unsigned arithmetic so a negative offset cannot trigger signed-integer
+    overflow (undefined behavior). A negative move that would cross the start is detected explicitly.
+    */
+    if (offset < 0) {
+        drwav_uint64 back = (drwav_uint64)(-(offset + 1)) + 1;
+        if (back > base) {
+            drwav__memory_stream_write_set_error(pStream, DRWAV_BAD_SEEK);
+            return DRWAV_FALSE;  /* Trying to seek prior to the start of the buffer. */
+        }
+        newCursor = base - back;
+    } else {
+        newCursor = base + (drwav_uint64)offset;
+        if (newCursor < base) {
+            drwav__memory_stream_write_set_error(pStream, DRWAV_TOO_BIG);
+            return DRWAV_FALSE;  /* Position wrapped past the 64-bit address space. */
+        }
     }
-    if ((size_t)newCursor > pWav->memoryStreamWrite.dataSize) {
-        return DRWAV_FALSE;  /* Trying to seek beyond the end of the buffer. */
+
+    if (pStream->isFixedBuffer && newCursor > pStream->dataCapacity) {
+        drwav__memory_stream_write_set_error(pStream, DRWAV_OUT_OF_RANGE);
+        return DRWAV_FALSE;  /* Fixed buffer: trying to seek beyond the caller's hard capacity. */
     }
 
-    pWav->memoryStreamWrite.currentWritePos = (size_t)newCursor;
+    if (newCursor > (drwav_uint64)DRWAV_SIZE_MAX) {
+        drwav__memory_stream_write_set_error(pStream, DRWAV_TOO_BIG);
+        return DRWAV_FALSE;  /* Growable buffer: position is not addressable on this platform. */
+    }
+
+    pStream->currentWritePos = newCursor;
 
     return DRWAV_TRUE;
+}
+
+DRWAV_PRIVATE drwav_bool32 drwav__on_seek_memory_write(void* pUserData, int offset, drwav_seek_origin origin)
+{
+    drwav* pWav = (drwav*)pUserData;
+
+    DRWAV_ASSERT(pWav != NULL);
+
+    return drwav__on_seek_memory_write_64(&pWav->memoryStreamWrite, (drwav_int64)offset, origin);
 }
 
 DRWAV_PRIVATE drwav_bool32 drwav__on_tell_memory(void* pUserData, drwav_int64* pCursor)
@@ -5829,9 +5958,12 @@ DRWAV_PRIVATE drwav_bool32 drwav_init_memory_write__internal(drwav* pWav, void**
 
     pWav->memoryStreamWrite.ppData = ppData;
     pWav->memoryStreamWrite.pDataSize = pDataSize;
+    pWav->memoryStreamWrite.pData = NULL;
     pWav->memoryStreamWrite.dataSize = 0;
-    pWav->memoryStreamWrite.dataCapacity = 0;
+    pWav->memoryStreamWrite.dataCapacity = 0;   /* Grown on demand in drwav__on_write_memory(). */
     pWav->memoryStreamWrite.currentWritePos = 0;
+    pWav->memoryStreamWrite.isFixedBuffer = DRWAV_FALSE;
+    pWav->memoryStreamWrite.error = DRWAV_SUCCESS;
 
     return drwav_init_write__internal(pWav, pFormat, totalSampleCount);
 }
@@ -5855,6 +5987,40 @@ DRWAV_API drwav_bool32 drwav_init_memory_write_sequential_pcm_frames(drwav* pWav
     return drwav_init_memory_write_sequential(pWav, ppData, pDataSize, pFormat, totalPCMFrameCount*pFormat->channels, pAllocationCallbacks);
 }
 
+DRWAV_API drwav_bool32 drwav_init_fixed_memory_write(drwav* pWav, void* pData, drwav_uint64 dataCapacity, size_t* pDataSize, const drwav_data_format* pFormat, const drwav_allocation_callbacks* pAllocationCallbacks)
+{
+    if (pWav == NULL || pData == NULL || pDataSize == NULL || pFormat == NULL || dataCapacity == 0) {
+        return DRWAV_FALSE;
+    }
+
+    if (dataCapacity > (drwav_uint64)DRWAV_SIZE_MAX) {
+        return DRWAV_FALSE;
+    }
+
+    *pDataSize = 0;
+
+    if (!drwav_preinit_write(pWav, pFormat, DRWAV_FALSE, drwav__on_write_memory, drwav__on_seek_memory_write, pWav, pAllocationCallbacks)) {
+        return DRWAV_FALSE;
+    }
+
+    /*
+    Fixed-buffer mode: dr_wav never allocates and never moves the buffer. The caller keeps ownership of the
+    memory. Writes that would exceed dataCapacity fail with DRWAV_OUT_OF_RANGE (surfaced through
+    drwav_write_pcm_frames() returning 0 and drwav_uninit() returning the error code). The buffer must be
+    initialized by the caller; sparse gaps are not zero-filled by dr_wav in this mode.
+    */
+    pWav->memoryStreamWrite.ppData = NULL;
+    pWav->memoryStreamWrite.pDataSize = pDataSize;
+    pWav->memoryStreamWrite.pData = (drwav_uint8*)pData;
+    pWav->memoryStreamWrite.dataSize = 0;
+    pWav->memoryStreamWrite.dataCapacity = dataCapacity;
+    pWav->memoryStreamWrite.currentWritePos = 0;
+    pWav->memoryStreamWrite.isFixedBuffer = DRWAV_TRUE;
+    pWav->memoryStreamWrite.error = DRWAV_SUCCESS;
+
+    return drwav_init_write__internal(pWav, pFormat, 0);
+}
+
 DRWAV_PRIVATE drwav_uint32 drwav_write_padding(drwav* pWav)
 {
     /* Do not adjust pWav->dataChunkDataSize - this should not include the padding. */
@@ -5875,27 +6041,34 @@ DRWAV_PRIVATE void drwav_write_chunk_sizes(drwav* pWav)
     to do this when using non-sequential mode.
     */
     if (pWav->onSeek != NULL && !pWav->isSequentialWrite) {
+        /*
+        Memory writers keep a 64-bit cursor and must go through the chunked seek helpers. Casting a position
+        larger than 2GB straight to the 32-bit offset of drwav_seek_proc would truncate the seek and corrupt
+        the backfill for large streams. The chunked helpers issue only safe 31-bit relative seeks.
+        */
+        drwav_bool32 isMemoryWriter = (pWav->onWrite == drwav__on_write_memory);
+
         if (pWav->container == drwav_container_riff) {
             /* The "RIFF" chunk size. */
-            if (pWav->onSeek(pWav->pUserData, 4, DRWAV_SEEK_SET)) {
+            if (isMemoryWriter ? drwav__seek_from_start(drwav__on_seek_memory_write, 4, pWav) : pWav->onSeek(pWav->pUserData, 4, DRWAV_SEEK_SET)) {
                 drwav_uint32 riffChunkSize = drwav__riff_chunk_size_riff(pWav->dataChunkDataSize, pWav->pMetadata, pWav->metadataCount);
                 drwav__write_u32ne_to_le(pWav, riffChunkSize);
             }
 
             /* The "data" chunk size. */
-            if (pWav->onSeek(pWav->pUserData, (int)pWav->dataChunkDataPos - 4, DRWAV_SEEK_SET)) {
+            if (isMemoryWriter ? drwav__seek_from_start(drwav__on_seek_memory_write, pWav->dataChunkDataPos - 4, pWav) : pWav->onSeek(pWav->pUserData, (int)pWav->dataChunkDataPos - 4, DRWAV_SEEK_SET)) {
                 drwav_uint32 dataChunkSize = drwav__data_chunk_size_riff(pWav->dataChunkDataSize);
                 drwav__write_u32ne_to_le(pWav, dataChunkSize);
             }
         } else if (pWav->container == drwav_container_w64) {
             /* The "RIFF" chunk size. */
-            if (pWav->onSeek(pWav->pUserData, 16, DRWAV_SEEK_SET)) {
+            if (isMemoryWriter ? drwav__seek_from_start(drwav__on_seek_memory_write, 16, pWav) : pWav->onSeek(pWav->pUserData, 16, DRWAV_SEEK_SET)) {
                 drwav_uint64 riffChunkSize = drwav__riff_chunk_size_w64(pWav->dataChunkDataSize);
                 drwav__write_u64ne_to_le(pWav, riffChunkSize);
             }
 
             /* The "data" chunk size. */
-            if (pWav->onSeek(pWav->pUserData, (int)pWav->dataChunkDataPos - 8, DRWAV_SEEK_SET)) {
+            if (isMemoryWriter ? drwav__seek_from_start(drwav__on_seek_memory_write, pWav->dataChunkDataPos - 8, pWav) : pWav->onSeek(pWav->pUserData, (int)pWav->dataChunkDataPos - 8, DRWAV_SEEK_SET)) {
                 drwav_uint64 dataChunkSize = drwav__data_chunk_size_w64(pWav->dataChunkDataSize);
                 drwav__write_u64ne_to_le(pWav, dataChunkSize);
             }
@@ -5904,13 +6077,13 @@ DRWAV_PRIVATE void drwav_write_chunk_sizes(drwav* pWav)
             int ds64BodyPos = 12 + 8;
 
             /* The "RIFF" chunk size. */
-            if (pWav->onSeek(pWav->pUserData, ds64BodyPos + 0, DRWAV_SEEK_SET)) {
+            if (isMemoryWriter ? drwav__seek_from_start(drwav__on_seek_memory_write, (drwav_uint64)ds64BodyPos + 0, pWav) : pWav->onSeek(pWav->pUserData, ds64BodyPos + 0, DRWAV_SEEK_SET)) {
                 drwav_uint64 riffChunkSize = drwav__riff_chunk_size_rf64(pWav->dataChunkDataSize, pWav->pMetadata, pWav->metadataCount);
                 drwav__write_u64ne_to_le(pWav, riffChunkSize);
             }
 
             /* The "data" chunk size. */
-            if (pWav->onSeek(pWav->pUserData, ds64BodyPos + 8, DRWAV_SEEK_SET)) {
+            if (isMemoryWriter ? drwav__seek_from_start(drwav__on_seek_memory_write, (drwav_uint64)ds64BodyPos + 8, pWav) : pWav->onSeek(pWav->pUserData, ds64BodyPos + 8, DRWAV_SEEK_SET)) {
                 drwav_uint64 dataChunkSize = drwav__data_chunk_size_rf64(pWav->dataChunkDataSize);
                 drwav__write_u64ne_to_le(pWav, dataChunkSize);
             }
@@ -5921,10 +6094,24 @@ DRWAV_PRIVATE void drwav_write_chunk_sizes(drwav* pWav)
 DRWAV_API drwav_result drwav_uninit(drwav* pWav)
 {
     drwav_result result = DRWAV_SUCCESS;
+    drwav_bool32 isMemoryWriter;
+    drwav_result memoryStreamError;
 
     if (pWav == NULL) {
         return DRWAV_INVALID_ARGS;
     }
+
+    /*
+    Idempotency: drwav_uninit() may be called more than once on the same object. A second call is a no-op
+    that reports success. A zeroed drwav has no callbacks, which is how an already-uninitialized object is
+    recognized.
+    */
+    if (pWav->onWrite == NULL && pWav->onRead == NULL) {
+        return DRWAV_SUCCESS;
+    }
+
+    isMemoryWriter = (pWav->onWrite == drwav__on_write_memory);
+    memoryStreamError = isMemoryWriter ? pWav->memoryStreamWrite.error : DRWAV_SUCCESS;
 
     if (pWav->onWrite != NULL) {
         if (pWav->isSequentialWrite) {
@@ -5938,6 +6125,14 @@ DRWAV_API drwav_result drwav_uninit(drwav* pWav)
             if (pWav->dataChunkDataSize != pWav->dataChunkDataSizeTargetWrite) {
                 result = DRWAV_INVALID_FILE;
             }
+        } else {
+            /*
+            Non-sequential writers place placeholder sizes in the RIFF/data headers and update them on every
+            write. Do one final backfill here so the on-disk/in-memory headers are correct even when no audio
+            was written, or the last write's backfill failed. Memory writers use the 64-bit chunked seek path
+            internally so positions beyond 4GB are handled correctly.
+            */
+            drwav_write_chunk_sizes(pWav);
         }
     } else {
         drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
@@ -5952,6 +6147,17 @@ DRWAV_API drwav_result drwav_uninit(drwav* pWav)
         fclose((FILE*)pWav->pUserData);
     }
 #endif
+
+    /*
+    A failure recorded by the memory stream (out-of-range write, failed allocation, bad seek) takes
+    precedence so callers can detect truncated output after closing the writer.
+    */
+    if (result == DRWAV_SUCCESS && memoryStreamError != DRWAV_SUCCESS) {
+        result = memoryStreamError;
+    }
+
+    /* Mark the object as uninitialized so a repeated drwav_uninit() is a safe no-op. */
+    DRWAV_ZERO_MEMORY(pWav, sizeof(*pWav));
 
     return result;
 }
