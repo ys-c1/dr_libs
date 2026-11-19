@@ -224,6 +224,12 @@ endfunction()
 
 
 if(DR_LIBS_BUILD_TESTS)
+    # 统一错误域映射测试：无外部依赖，只链接接口头文件，独立于下方的测试依赖安装。
+    enable_testing()
+    add_executable(dr_unified_error_test tests/dr_unified_error_test.c)
+    target_link_libraries(dr_unified_error_test PRIVATE dr_libs_interface)
+    add_test(NAME dr_unified_error_test COMMAND dr_unified_error_test)
+
     dr_libs_setup_test_dependencies()
 
     add_executable(dr_libs_test tests/dr_libs_test.c)
