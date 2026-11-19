@@ -627,6 +627,15 @@ typedef struct
 
 typedef struct
 {
+    /* Byte offset of the frame's sync code relative to the start of the underlying stream. */
+    drflac_uint64 bytePos;
+
+    /* Index of the first PCM frame contained in this FLAC frame. */
+    drflac_uint64 firstPCMFrame;
+} drflac_frame_index_entry;
+
+typedef struct
+{
     /* The function to call when a metadata block is read. */
     drflac_meta_proc onMeta;
 
@@ -698,6 +707,18 @@ typedef struct
     drflac_bool32 _noSeekTableSeek    : 1;
     drflac_bool32 _noBinarySearchSeek : 1;
     drflac_bool32 _noBruteForceSeek   : 1;
+
+    /*
+    Sparse index of FLAC frame headers used for fast random seeking. Each entry records the byte position of a frame header and
+    the PCM frame number at which that frame starts. Only every Nth frame is stored (N = frameIndexStride). Built lazily by
+    drflac_seek_to_pcm_frame() or explicitly with drflac_frame_index_build(). NULL when the index has not been built. Separate
+    heap allocation so the main decoder allocation is unaffected.
+    */
+    drflac_frame_index_entry* pFrameIndex;
+    drflac_uint32 frameIndexEntryCount;
+    drflac_uint32 frameIndexCapacity;
+    drflac_uint32 frameIndexStride;       /* Number of FLAC frames between consecutive entries. */
+    drflac_bool32 frameIndexBuildAttempted;  /* Set after the first build attempt so an unindexable stream is not rescanned on every seek. */
 
     /* The bit streamer. The raw FLAC data is fed through this object. */
     drflac_bs bs;
@@ -1008,6 +1029,40 @@ Return Value
 */
 DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 pcmFrameIndex);
 
+
+/*
+Builds the sparse frame index used for fast random seeking.
+
+The index records the byte position and first PCM frame number of every Nth FLAC frame in the stream. It is built lazily by
+drflac_seek_to_pcm_frame(), but can be built ahead of time with this function so that the cost is paid at a predictable moment.
+Building the index moves the read position of the underlying stream; the decoder is left positioned at the start of the audio
+afterwards, equivalent to drflac_seek_to_pcm_frame(pFlac, 0).
+
+Only native FLAC streams with a seekable and tellable backend are supported. Ogg encapsulated streams and custom backends
+without an onTell callback return DRFLAC_FALSE, in which case drflac_seek_to_pcm_frame() keeps using its other seek techniques.
+
+Return Value
+------------
+`DRFLAC_TRUE` if successful; `DRFLAC_FALSE` otherwise. Calling this again on an already-indexed decoder is a no-op that
+returns `DRFLAC_TRUE`.
+*/
+DRFLAC_API drflac_bool32 drflac_frame_index_build(drflac* pFlac);
+
+/*
+Retrieves statistics about the frame index.
+
+pEntryCountOut (out, optional)
+    The number of entries currently stored in the index.
+
+pStrideOut (out, optional)
+    The number of FLAC frames between consecutive entries.
+
+pIndexBytesOut (out, optional)
+    The number of bytes currently occupied by the index allocation.
+
+All output pointers are optional. Returns `DRFLAC_FALSE` if the index has not been built, in which case all outputs are set to 0.
+*/
+DRFLAC_API drflac_bool32 drflac_frame_index_get_stats(drflac* pFlac, drflac_uint32* pEntryCountOut, drflac_uint32* pStrideOut, size_t* pIndexBytesOut);
 
 
 #ifndef DR_FLAC_NO_STDIO
@@ -6102,6 +6157,333 @@ static drflac_bool32 drflac__seek_to_pcm_frame__brute_force(drflac* pFlac, drfla
 }
 
 
+/*
+Sparse frame index for fast random seeking.
+
+The index stores the byte position and first PCM frame number of every Nth FLAC frame. A seek then binary-searches the index
+for the entry whose frame starts at or before the target PCM frame, seeks the bitstream to that frame header and decodes
+forward to the target. This replaces the O(log n) byte-level binary search (which decodes whole frames at every probe) with
+one bitstream seek plus at most a few frame decodes, and works without CRC support and without a native SEEKTABLE.
+*/
+
+/* The index allocation is capped at this fraction of the stream size to stay within the memory budget. */
+#define DRFLAC_FRAME_INDEX_MEMORY_BUDGET_NUMERATOR    1
+#define DRFLAC_FRAME_INDEX_MEMORY_BUDGET_DENOMINATOR  100
+
+/* Smallest number of entries the capacity is ever compacted down to. */
+#define DRFLAC_FRAME_INDEX_MIN_CAPACITY               2
+
+/* Test hook. When defined, the growing index allocation is never allowed to exceed this many entries so compaction can be
+exercised deterministically. Not part of the public API. */
+/* #define DR_FLAC_FRAME_INDEX_MAX_CAPACITY <number> */
+
+/* Allocation helpers are defined later in this file; forward-declare them so the index routines can use them. */
+static void* drflac__malloc_from_callbacks(size_t sz, const drflac_allocation_callbacks* pAllocationCallbacks);
+static void  drflac__free_from_callbacks(void* p, const drflac_allocation_callbacks* pAllocationCallbacks);
+
+/*
+Returns the byte position of the next byte the bitstreamer will consume. Only valid when the bitstreamer is sitting on a byte
+boundary, which is always the case between two FLAC frames: after a frame body has been skipped the stream is byte aligned,
+and the initial position from drflac__seek_to_first_frame() is byte aligned as well.
+
+The L2 cache is one client read ahead of the L1 cache: cacheL2 holds L2_SIZE bytes ending at the client cursor, and the L1
+line currently being consumed is the last L2 line handed out (index nextL2Line-1). Everything still buffered between the
+client cursor and the next consumed byte is therefore the unconsumed L2 tail plus the unconsumed bytes of the L1 line.
+*/
+static drflac_bool32 drflac__tell_aligned_byte(drflac_bs* bs, drflac_uint64* pBytePosOut)
+{
+    drflac_int64 cursor;
+    drflac_uint64 bufferedBytes;
+
+    DRFLAC_ASSERT(bs != NULL);
+    DRFLAC_ASSERT(pBytePosOut != NULL);
+    DRFLAC_ASSERT((DRFLAC_CACHE_L1_BITS_REMAINING(bs) & 7) == 0);
+
+    if (bs->onTell == NULL || !bs->onTell(bs->pUserData, &cursor) || cursor < 0) {
+        return DRFLAC_FALSE;
+    }
+
+    /* Everything still buffered between the client cursor and the next consumed byte. */
+    bufferedBytes = ((drflac_uint64)(DRFLAC_CACHE_L2_LINE_COUNT(bs) - bs->nextL2Line) * DRFLAC_CACHE_L1_SIZE_BYTES(bs))
+                  + (DRFLAC_CACHE_L1_BITS_REMAINING(bs) >> 3)
+                  + bs->unalignedByteCount;
+
+    if ((drflac_uint64)cursor < bufferedBytes) {
+        return DRFLAC_FALSE;
+    }
+
+    *pBytePosOut = (drflac_uint64)cursor - bufferedBytes;
+    return DRFLAC_TRUE;
+}
+
+/*
+Records frame frameOrdinal in the index when it falls on the current stride, compacting in place first if the capacity is
+full. Compaction retains entry 0 and every second existing entry and doubles the stride; it is only ever triggered by a frame
+that was eligible under the old stride, and such an ordinal is always a multiple of the new (doubled) stride, so the frame is
+immediately re-recorded afterwards. Capacities are always even and the index only fills at an even entry count, which keeps
+every retained entry aligned with the new stride. The allocation never grows, keeping the index within its memory budget.
+*/
+static drflac_bool32 drflac__frame_index_append(drflac* pFlac, drflac_uint64 frameOrdinal, drflac_uint64 bytePos, drflac_uint64 firstPCMFrame)
+{
+    if ((frameOrdinal % pFlac->frameIndexStride) != 0) {
+        return DRFLAC_TRUE;    /* Not an entry frame under the current stride. */
+    }
+
+    if (pFlac->frameIndexEntryCount >= pFlac->frameIndexCapacity) {
+        drflac_uint32 iDst;
+        drflac_uint32 iSrc;
+
+        /* In-place compaction: retain entries 0, 2, 4, ... and double the stride. */
+        iDst = 0;
+        iSrc = 0;
+        while (iSrc < pFlac->frameIndexEntryCount) {
+            pFlac->pFrameIndex[iDst] = pFlac->pFrameIndex[iSrc];
+            iDst += 1;
+            iSrc += 2;
+        }
+
+        pFlac->frameIndexEntryCount = iDst;
+        pFlac->frameIndexStride    *= 2;
+    }
+
+    pFlac->pFrameIndex[pFlac->frameIndexEntryCount].bytePos       = bytePos;
+    pFlac->pFrameIndex[pFlac->frameIndexEntryCount].firstPCMFrame = firstPCMFrame;
+    pFlac->frameIndexEntryCount += 1;
+    return DRFLAC_TRUE;
+}
+
+/*
+Scans every FLAC frame in the stream once, reading only frame headers and skipping frame bodies, and records every Nth frame's
+byte position and starting PCM frame. Leaves the decoder positioned at the first frame, exactly like drflac__seek_to_first_frame().
+
+The entry density is chosen up front so the allocation stays within the memory budget (1% of the stream size): the total frame
+count is estimated from STREAMINFO's total PCM frame count and maximum block size, and every Nth frame is recorded. If the
+estimate turns out low and the capacity fills, the stride is doubled and the existing entries are compacted in place, so the
+allocation never grows beyond the budget-derived capacity.
+*/
+static drflac_bool32 drflac__frame_index_build_internal(drflac* pFlac)
+{
+    drflac_int64 streamSize;
+    drflac_uint32 capacity;
+    drflac_uint32 initialStride;
+    drflac_uint64 estimatedFrameCount;
+    drflac_uint64 frameOrdinal;
+    drflac_bool32 wasSuccessful = DRFLAC_FALSE;
+    drflac_frame_index_entry* pEntries;
+
+    DRFLAC_ASSERT(pFlac != NULL);
+
+    /* Mark the attempt up front so an unindexable stream (Ogg, no seek/tell backend, ...) is not rescanned on every seek. */
+    pFlac->frameIndexBuildAttempted = DRFLAC_TRUE;
+
+#ifndef DR_FLAC_NO_OGG
+    if (pFlac->container == drflac_container_ogg) {
+        return DRFLAC_FALSE;   /* Ogg streams have their own accelerated seeking and no byte-position mapping. */
+    }
+#endif
+
+    if (pFlac->bs.onSeek == NULL || pFlac->bs.onTell == NULL) {
+        return DRFLAC_FALSE;   /* Frame indexing requires a seekable and tellable backend. */
+    }
+
+    /* Determine the stream size to size the allocation against the memory budget. */
+    if (!pFlac->bs.onSeek(pFlac->bs.pUserData, 0, DRFLAC_SEEK_END) || !pFlac->bs.onTell(pFlac->bs.pUserData, &streamSize) || streamSize <= 0) {
+        return DRFLAC_FALSE;
+    }
+
+    capacity = (drflac_uint32)(((drflac_uint64)streamSize * DRFLAC_FRAME_INDEX_MEMORY_BUDGET_NUMERATOR)
+                             / (DRFLAC_FRAME_INDEX_MEMORY_BUDGET_DENOMINATOR * sizeof(drflac_frame_index_entry)));
+    if (capacity < DRFLAC_FRAME_INDEX_MIN_CAPACITY) {
+        capacity = DRFLAC_FRAME_INDEX_MIN_CAPACITY;
+    }
+#if defined(DR_FLAC_FRAME_INDEX_MAX_CAPACITY)
+    if (capacity > DR_FLAC_FRAME_INDEX_MAX_CAPACITY) {
+        capacity = DR_FLAC_FRAME_INDEX_MAX_CAPACITY;
+    }
+#endif
+    /* Capacities must stay even so compaction invariants hold (see drflac__frame_index_append). */
+    capacity &= ~(drflac_uint32)1;
+    if (capacity < 2) {
+        capacity = 2;
+    }
+
+    /*
+    Pick the initial stride so the estimated number of entries fits the capacity. The estimate uses STREAMINFO's maximum
+    block size which yields a lower bound on the frame count, so the estimate errs toward fewer, larger frames; the in-place
+    compaction below covers streams whose real frame count is higher.
+    */
+    initialStride = 1;
+    if (pFlac->totalPCMFrameCount > 0 && pFlac->maxBlockSizeInPCMFrames > 0) {
+        estimatedFrameCount = (pFlac->totalPCMFrameCount + pFlac->maxBlockSizeInPCMFrames - 1) / pFlac->maxBlockSizeInPCMFrames;
+        if (estimatedFrameCount > capacity) {
+            initialStride = (drflac_uint32)((estimatedFrameCount + capacity - 1) / capacity);
+            if (initialStride < 2) {
+                initialStride = 2;
+            }
+        }
+    }
+
+    pEntries = (drflac_frame_index_entry*)drflac__malloc_from_callbacks(sizeof(drflac_frame_index_entry) * capacity, &pFlac->allocationCallbacks);
+    if (pEntries == NULL) {
+        return DRFLAC_FALSE;
+    }
+
+    if (!drflac__seek_to_first_frame(pFlac)) {
+        drflac__free_from_callbacks(pEntries, &pFlac->allocationCallbacks);
+        return DRFLAC_FALSE;
+    }
+
+    pFlac->pFrameIndex            = pEntries;
+    pFlac->frameIndexEntryCount   = 0;
+    pFlac->frameIndexCapacity     = capacity;
+    pFlac->frameIndexStride       = initialStride;
+    frameOrdinal                  = 0;
+
+    for (;;) {
+        drflac_uint64 frameBytePos;
+        drflac_uint64 firstPCMFrame;
+        drflac_result seekResult;
+
+        /*
+        Capture the frame's sync byte before reading its header. At this point the previous frame (or drflac__seek_to_first_frame
+        above) has left the stream byte aligned on a frame boundary, which is the only position where the cache-based tell is
+        exact. A frame header is variable length and can cross cache-line reloads, so its position cannot be reconstructed after
+        the fact.
+        */
+        if (!drflac__tell_aligned_byte(&pFlac->bs, &frameBytePos)) {
+            break;
+        }
+
+        if (!drflac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+            /* A clean end of stream after at least one indexed frame is the normal loop exit. */
+            wasSuccessful = (pFlac->frameIndexEntryCount > 0);
+            break;
+        }
+
+        drflac__get_pcm_frame_range_of_current_flac_frame(pFlac, &firstPCMFrame, NULL);
+
+        seekResult = drflac__seek_flac_frame(pFlac);
+        if (seekResult != DRFLAC_SUCCESS) {
+            /*
+            A frame that does not survive a full body scan (CRC mismatch, truncated frame, ...) is not safe to index. Re-seek
+            to its sync byte and let the next header search re-synchronize; re-seeking also prevents the sync search from
+            matching a 0xFFF8 pattern inside the body we just scanned over.
+            */
+            if (seekResult == DRFLAC_AT_END || !drflac__seek_to_byte(&pFlac->bs, frameBytePos)) {
+                break;
+            }
+            DRFLAC_ZERO_MEMORY(&pFlac->currentFLACFrame, sizeof(pFlac->currentFLACFrame));
+            continue;
+        }
+
+        if (!drflac__frame_index_append(pFlac, frameOrdinal, frameBytePos, firstPCMFrame)) {
+            break;
+        }
+
+        frameOrdinal += 1;
+    }
+
+    /* Always leave the decoder in the canonical "sitting on the first frame" state. */
+    drflac__seek_to_first_frame(pFlac);
+
+    if (!wasSuccessful) {
+        drflac__free_from_callbacks(pFlac->pFrameIndex, &pFlac->allocationCallbacks);
+        pFlac->pFrameIndex            = NULL;
+        pFlac->frameIndexEntryCount   = 0;
+        pFlac->frameIndexCapacity     = 0;
+        pFlac->frameIndexStride       = 0;
+    }
+
+    return wasSuccessful;
+}
+
+/*
+Seeks using the sparse frame index: binary-search the entry whose frame starts at or before the target PCM frame, seek the
+bitstream to that frame header, then decode forward to the target. On success the decoder state (current frame, remaining
+sample count and currentPCMFrame) is identical to what a sequential decode would have produced at the target.
+*/
+static drflac_bool32 drflac__seek_to_pcm_frame__frame_index(drflac* pFlac, drflac_uint64 pcmFrameIndex)
+{
+    drflac_uint32 iLo;
+    drflac_uint32 iHi;
+    drflac_uint32 iCandidate;
+
+    DRFLAC_ASSERT(pFlac != NULL);
+    DRFLAC_ASSERT(pFlac->pFrameIndex != NULL);
+    DRFLAC_ASSERT(pFlac->frameIndexEntryCount > 0);
+
+    /* Binary search for the last entry whose first PCM frame is <= the target. */
+    iLo = 0;
+    iHi = pFlac->frameIndexEntryCount;    /* Half-open upper bound. */
+    while (iLo < iHi) {
+        drflac_uint32 iMid = iLo + ((iHi - iLo) >> 1);
+        if (pFlac->pFrameIndex[iMid].firstPCMFrame <= pcmFrameIndex) {
+            iLo = iMid + 1;
+        } else {
+            iHi = iMid;
+        }
+    }
+
+    if (iLo == 0) {
+        return DRFLAC_FALSE;   /* Every indexed frame starts after the target; the index is not usable for this target. */
+    }
+    iCandidate = iLo - 1;
+
+    if (!drflac__seek_to_byte(&pFlac->bs, pFlac->pFrameIndex[iCandidate].bytePos)) {
+        return DRFLAC_FALSE;
+    }
+    DRFLAC_ZERO_MEMORY(&pFlac->currentFLACFrame, sizeof(pFlac->currentFLACFrame));
+
+    if (!drflac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+        return DRFLAC_FALSE;
+    }
+
+    drflac__get_pcm_frame_range_of_current_flac_frame(pFlac, &pFlac->currentPCMFrame, NULL);
+    if (pFlac->currentPCMFrame > pcmFrameIndex) {
+        return DRFLAC_FALSE;   /* Should be impossible given the binary search, but guard against a malformed frame header. */
+    }
+
+    /*
+    Decode the frame at the index entry and walk forward frame by frame until the frame containing the target is reached,
+    then skip the leading samples. This is the same sample-exact logic as the brute-force path, but it starts from an exact
+    frame location instead of scanning from the beginning. Every indexed frame passed a full CRC check during the build, so
+    hitting a corrupt frame here means the stream changed underneath the decoder; reporting failure lets the public seek
+    routine fall back to its other techniques.
+    */
+    for (;;) {
+        drflac_uint64 firstPCMFrameInFLACFrame;
+        drflac_uint64 lastPCMFrameInFLACFrame;
+        drflac_result result;
+
+        drflac__get_pcm_frame_range_of_current_flac_frame(pFlac, &firstPCMFrameInFLACFrame, &lastPCMFrameInFLACFrame);
+
+        if (pcmFrameIndex <= lastPCMFrameInFLACFrame) {
+            /* Target sample is inside this frame. */
+            result = drflac__decode_flac_frame(pFlac);
+            if (result != DRFLAC_SUCCESS) {
+                return DRFLAC_FALSE;
+            }
+
+            return drflac__seek_forward_by_pcm_frames(pFlac, pcmFrameIndex - firstPCMFrameInFLACFrame) == (pcmFrameIndex - firstPCMFrameInFLACFrame);
+        }
+
+        /* Target is in a later frame. Skip this frame's body without decoding the samples. */
+        result = drflac__seek_flac_frame(pFlac);
+        if (result == DRFLAC_AT_END) {
+            /* Seeking to exactly the end-of-stream PCM frame. */
+            return pcmFrameIndex == lastPCMFrameInFLACFrame + 1;
+        }
+        if (result != DRFLAC_SUCCESS) {
+            return DRFLAC_FALSE;
+        }
+
+        if (!drflac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+            return DRFLAC_FALSE;
+        }
+    }
+}
+
+
 #if !defined(DR_FLAC_NO_CRC)
 /*
 We use an average compression ratio to determine our approximate start location. FLAC files are generally about 50%-70% the size of their
@@ -9613,6 +9995,7 @@ DRFLAC_API void drflac_close(drflac* pFlac)
 #endif
 
     drflac__free_from_callbacks(pFlac->pDecodedSamplesAllocation, &pFlac->allocationCallbacks);
+    drflac__free_from_callbacks(pFlac->pFrameIndex, &pFlac->allocationCallbacks);
     drflac__free_from_callbacks(pFlac, &pFlac->allocationCallbacks);
 }
 
@@ -12633,8 +13016,21 @@ DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 p
         else
 #endif
         {
+            /*
+            Fast path: the sparse frame index. It is built lazily on the first seek that needs it. If the stream cannot be
+            indexed (Ogg encapsulation, no seek/tell backend or an allocation failure) the build returns false and the
+            legacy techniques below take over unchanged.
+            */
+            if (pFlac->pFrameIndex == NULL && !pFlac->frameIndexBuildAttempted) {
+                drflac__frame_index_build_internal(pFlac);
+            }
+
+            if (pFlac->pFrameIndex != NULL) {
+                wasSuccessful = drflac__seek_to_pcm_frame__frame_index(pFlac, pcmFrameIndex);
+            }
+
             /* First try seeking via the seek table. If this fails, fall back to a brute force seek which is much slower. */
-            if (/*!wasSuccessful && */!pFlac->_noSeekTableSeek) {
+            if (!wasSuccessful && !pFlac->_noSeekTableSeek) {
                 wasSuccessful = drflac__seek_to_pcm_frame__seek_table(pFlac, pcmFrameIndex);
             }
 
@@ -12664,6 +13060,52 @@ DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 p
 
         return wasSuccessful;
     }
+}
+
+
+DRFLAC_API drflac_bool32 drflac_frame_index_build(drflac* pFlac)
+{
+    if (pFlac == NULL) {
+        return DRFLAC_FALSE;
+    }
+
+    if (pFlac->pFrameIndex != NULL) {
+        return DRFLAC_TRUE;    /* Already built. */
+    }
+    if (pFlac->frameIndexBuildAttempted) {
+        return DRFLAC_FALSE;   /* A previous attempt already determined this stream cannot be indexed. */
+    }
+
+    return drflac__frame_index_build_internal(pFlac);
+}
+
+DRFLAC_API drflac_bool32 drflac_frame_index_get_stats(drflac* pFlac, drflac_uint32* pEntryCountOut, drflac_uint32* pStrideOut, size_t* pIndexBytesOut)
+{
+    if (pEntryCountOut != NULL) {
+        *pEntryCountOut = 0;
+    }
+    if (pStrideOut != NULL) {
+        *pStrideOut = 0;
+    }
+    if (pIndexBytesOut != NULL) {
+        *pIndexBytesOut = 0;
+    }
+
+    if (pFlac == NULL || pFlac->pFrameIndex == NULL) {
+        return DRFLAC_FALSE;
+    }
+
+    if (pEntryCountOut != NULL) {
+        *pEntryCountOut = pFlac->frameIndexEntryCount;
+    }
+    if (pStrideOut != NULL) {
+        *pStrideOut = pFlac->frameIndexStride;
+    }
+    if (pIndexBytesOut != NULL) {
+        *pIndexBytesOut = sizeof(drflac_frame_index_entry) * pFlac->frameIndexCapacity;
+    }
+
+    return DRFLAC_TRUE;
 }
 
 
